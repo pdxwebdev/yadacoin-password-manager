@@ -86,6 +86,32 @@ window.addEventListener("message", (event) => {
     );
   }
 
+  if (data.type === "YADA_PASSWORD_CREATE_VAULT") {
+    const requestId = data.requestId;
+    chrome.runtime.sendMessage(
+      {
+        type: "YADA_CREATE_VAULT",
+        requestId,
+        username: data.username,
+        secondFactor: data.secondFactor,
+        origin: window.location.origin,
+      },
+      (response) => {
+        const err = chrome.runtime.lastError;
+        window.postMessage(
+          {
+            type: "YADA_PASSWORD_CREATE_VAULT_RESULT",
+            requestId,
+            ...(err
+              ? { ok: false, message: err.message }
+              : response || { ok: false, message: "no response" }),
+          },
+          "*"
+        );
+      }
+    );
+  }
+
   if (data.type === "YADA_PASSWORD_SIGNIN") {
     const requestId = data.requestId;
     chrome.runtime.sendMessage(

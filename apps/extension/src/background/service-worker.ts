@@ -25,6 +25,10 @@ import {
   siteForSignIn,
   syncInceptionFromNode,
   broadcastTxns,
+  buildInceptionTxn,
+  createVaultSeed,
+  identityAfterInception,
+  isAlreadyInceptedError,
   unlockIdentity,
   vaultIdFromData,
   websocketPeerIdentity,
@@ -151,7 +155,7 @@ async function refreshInception(
   return next;
 }
 
-const EXT_VERSION = "0.1.34";
+const EXT_VERSION = "0.1.35";
 
 function sameNode(a: string, b: string): boolean {
   return a.replace(/\/+$/, "").toLowerCase() === b.replace(/\/+$/, "").toLowerCase();
@@ -930,7 +934,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       try {
         let v = await loadVault();
         if (!v?.mnemonic) {
-          sendResponse({ ok: false, message: "no vault" });
+          sendResponse({ ok: false, message: "no vault", extVersion: EXT_VERSION, canCreateVault: true });
           return;
         }
         const address = baseReceiveAddress(v.mnemonic);
@@ -939,11 +943,99 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           username: (v.username || "").replace(/^@/, ""),
           identity: vaultIdFromData(v),
           baseAddress: address,
+          extVersion: EXT_VERSION,
+          canCreateVault: true,
         });
       } catch (e) {
         sendResponse({
           ok: false,
           message: e instanceof Error ? e.message : String(e),
+          extVersion: EXT_VERSION,
+          canCreateVault: true,
+        });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === "YADA_CREATE_VAULT") {
+    void (async () => {
+      try {
+        const username = String(message.username || "").trim().replace(/^@/, "");
+        const secondFactor = String(message.secondFactor || "");
+        if (!username) throw new Error("username required");
+        if (!secondFactor) throw new Error("master password required");
+        const existing = await loadVault();
+        if (existing?.mnemonic) {
+          sendResponse({
+            ok: true,
+            existing: true,
+            username: (existing.username || "").replace(/^@/, ""),
+            baseAddress: baseReceiveAddress(existing.mnemonic),
+            inceptionDone: !!existing.inceptionDone,
+          });
+          return;
+        }
+        const mnemonic = createVaultSeed(128);
+        const identity: VaultIdentity = unlockIdentity(mnemonic, secondFactor, username);
+        const vaultId = identity.k0.address;
+        let stored: StoredVault = {
+          mnemonic,
+          secondFactor,
+          username,
+          identityType: "social",
+          mainDepth: 0,
+          tipPrevPkh: "",
+          inceptionDone: false,
+          sites: {},
+        };
+        await store.saveVault(vaultId, stored, { name: username });
+        await store.setActiveVaultId(vaultId);
+        try {
+          const base = await resolveHomeApiBase({
+            username,
+            pageOrigin: String(message.origin || ""),
+            requestPermission: false,
+          });
+          if (base) {
+            stored = await refreshInception(stored, base);
+            if (!stored.inceptionDone) {
+              const txn = buildInceptionTxn(identity);
+              const res = await broadcastTxns({ baseUrl: base }, txn);
+              const already = isAlreadyInceptedError(res.body?.message);
+              if (res.ok || already) {
+                const after = identityAfterInception(identity);
+                stored = {
+                  ...stored,
+                  nodeUrl: base,
+                  mainDepth: after.mainDepth,
+                  tipPrevPkh: after.tipPrevPkh,
+                  inceptionDone: true,
+                };
+                await saveVault(stored);
+              } else {
+                stored = { ...stored, nodeUrl: base };
+                await saveVault(stored);
+              }
+            }
+          }
+        } catch {
+          /* keep the local vault; inception can be retried from the popup */
+        }
+        sendResponse({
+          ok: true,
+          existing: false,
+          username,
+          baseAddress: baseReceiveAddress(mnemonic),
+          mnemonic,
+          inceptionDone: !!stored.inceptionDone,
+        });
+      } catch (e) {
+        sendResponse({
+          ok: false,
+          message: e instanceof Error ? e.message : String(e),
+          extVersion: EXT_VERSION,
+          canCreateVault: true,
         });
       }
     })();
