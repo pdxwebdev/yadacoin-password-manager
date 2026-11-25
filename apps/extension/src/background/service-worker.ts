@@ -202,6 +202,7 @@ async function broadcastInceptionFor(
       if (!originBase || !/^https?:\/\//i.test(originBase)) return;
       if (!targets.some((t) => sameNode(t, originBase))) targets.push(originBase);
     };
+    addTarget(PURCHASE_HOME);
     addTarget(inceptionHome);
     addTarget(base);
     addTarget(returnUrl);
@@ -273,7 +274,9 @@ async function broadcastInceptionFor(
   }
 }
 
-const EXT_VERSION = "0.1.40";
+const EXT_VERSION = "0.1.41";
+/** Purchases run through Center Identity, so it must see the inception too. */
+const PURCHASE_HOME = "https://centeridentity.com";
 
 function sameNode(a: string, b: string): boolean {
   return a.replace(/\/+$/, "").toLowerCase() === b.replace(/\/+$/, "").toLowerCase();
