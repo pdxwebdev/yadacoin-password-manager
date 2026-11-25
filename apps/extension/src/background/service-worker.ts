@@ -19,6 +19,7 @@ import {
   registerSite,
   resyncSiteFromNode,
   resyncVaultFromNode,
+  resolvePasswordHome,
   rotateSitePassword,
   sealToRatchetPub,
   sealToX25519,
@@ -41,7 +42,7 @@ import {
 } from "@yadacoin/password-core";
 import { createExtensionVaultBackend } from "../shared/vault-backend.js";
 import { announceFile } from "../shared/announce.js";
-import { resolveHomeApiBase } from "../shared/home.js";
+import { rememberHome, resolveHomeApiBase } from "../shared/home.js";
 
 const store = new VaultStore(createExtensionVaultBackend());
 let migrated = false;
@@ -184,12 +185,24 @@ async function broadcastInceptionFor(
       tipPrevPkh: next.tipPrevPkh,
     });
     const txn = buildInceptionTxn(identity);
+    let inceptionHome = "";
+    try {
+      const route = await resolvePasswordHome(
+        base,
+        v.username,
+        identity.usernameSignature
+      );
+      inceptionHome = normalizeNodeBaseUrl(route?.node_http_base || "");
+    } catch {
+      /* home not resolvable yet */
+    }
     const targets: string[] = [];
     const addTarget = (raw?: string) => {
       const originBase = normalizeNodeBaseUrl(raw || "");
       if (!originBase || !/^https?:\/\//i.test(originBase)) return;
       if (!targets.some((t) => sameNode(t, originBase))) targets.push(originBase);
     };
+    addTarget(inceptionHome);
     addTarget(base);
     addTarget(returnUrl);
     const results = await Promise.all(
@@ -206,10 +219,37 @@ async function broadcastInceptionFor(
       (r) => r.res && (r.res.ok || isAlreadyInceptedError(r.res.body?.message))
     );
     if (accepted) {
+      // The pre-inception home pick often falls back to the page/return node
+      // because the identity is not announced yet. Once the inception lands,
+      // resolve again and push the same txn to the real home SP so it has the
+      // identity before the browser/page starts an auth session there.
+      let finalHome = "";
+      const resolveFrom = accepted.target || base;
+      for (let i = 0; i < 6; i += 1) {
+        try {
+          const route = await resolvePasswordHome(resolveFrom, v.username);
+          const candidate = normalizeNodeBaseUrl(route?.node_http_base || "");
+          if (route?.status && candidate) {
+            finalHome = candidate;
+            break;
+          }
+        } catch {
+          /* announcement not visible yet */
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+      if (finalHome && !targets.some((t) => sameNode(t, finalHome))) {
+        try {
+          await broadcastTxns({ baseUrl: finalHome }, txn);
+        } catch {
+          /* already incepted or home unreachable */
+        }
+      }
+      const homeBase = finalHome || inceptionHome || base;
       const after = identityAfterInception(identity);
       next = {
         ...next,
-        nodeUrl: base,
+        nodeUrl: homeBase,
         mainDepth: after.mainDepth,
         tipPrevPkh: after.tipPrevPkh,
         inceptionDone: true,
@@ -233,7 +273,7 @@ async function broadcastInceptionFor(
   }
 }
 
-const EXT_VERSION = "0.1.38";
+const EXT_VERSION = "0.1.40";
 
 function sameNode(a: string, b: string): boolean {
   return a.replace(/\/+$/, "").toLowerCase() === b.replace(/\/+$/, "").toLowerCase();
@@ -453,6 +493,7 @@ async function approveAuthRequest(
         message: "storage key returned",
       });
       await chrome.storage.local.remove(["yadaPendingAuth", "yadaPendingHome", "yadaApproveBusy"]);
+      await chrome.action.setBadgeText({ text: "" });
       return { ok: true, message: "Storage key returned to the page", action };
     }
 
@@ -476,6 +517,7 @@ async function approveAuthRequest(
       };
       await postAuthSessionResult(nodeUrl, p.session_id, resultBody);
       await chrome.storage.local.remove(["yadaPendingAuth", "yadaPendingHome", "yadaApproveBusy"]);
+      await chrome.action.setBadgeText({ text: "" });
       return { ok: true, message: "Identity returned to the page", action };
     }
 
@@ -490,6 +532,7 @@ async function approveAuthRequest(
         counter: v.sites?.[siteKey]?.counter ?? null,
       });
       await chrome.storage.local.remove(["yadaPendingAuth", "yadaPendingHome", "yadaApproveBusy"]);
+      await chrome.action.setBadgeText({ text: "" });
       return { ok: true, message: "Status approved", action };
     }
 
@@ -572,6 +615,7 @@ async function approveAuthRequest(
       throw new Error(firstErr || "could not deliver approval to the sign-in node");
     }
     await chrome.storage.local.remove(["yadaPendingAuth", "yadaPendingHome"]);
+    await chrome.action.setBadgeText({ text: "" });
     approveTail = Promise.all(
       ordered
         .filter((b) => !sameNode(b, primary))
@@ -632,6 +676,21 @@ function reportProgress(
 
 let authWs: WebSocket | null = null;
 let authWsKey = "";
+let forcedAuthHome: { username: string; base: string } | null = null;
+let forcedAuthHomeLoaded = false;
+
+async function loadForcedAuthHome(): Promise<void> {
+  if (forcedAuthHomeLoaded) return;
+  forcedAuthHomeLoaded = true;
+  try {
+    const stored = await chrome.storage.local.get("yadaAuthHome");
+    const row = stored.yadaAuthHome as { username?: string; home?: string } | undefined;
+    const base = normalizeNodeBaseUrl(String(row?.home || ""));
+    if (row?.username && base) forcedAuthHome = { username: row.username, base };
+  } catch {
+    /* ignore */
+  }
+}
 
 async function activePageOrigin(): Promise<string> {
   try {
@@ -644,19 +703,10 @@ async function activePageOrigin(): Promise<string> {
   }
 }
 
-async function connectAuthHome(): Promise<void> {
+async function connectAuthSocket(baseUrl: string): Promise<void> {
   const v = await loadVault();
   if (!v?.inceptionDone || !v.username) return;
-  const pageOrigin = await activePageOrigin();
-  const base = await resolveHomeApiBase({
-    username: v.username,
-    pageOrigin: pageOrigin || undefined,
-    cachedHome:
-      v.nodeUrl && pageOrigin && v.nodeUrl.replace(/\/+$/, "").toLowerCase() === pageOrigin
-        ? undefined
-        : v.nodeUrl,
-    requestPermission: false,
-  });
+  const base = normalizeNodeBaseUrl(baseUrl);
   if (!base) return;
   const identity = unlockIdentity(v.mnemonic, v.secondFactor, v.username, {
     identityType: v.identityType,
@@ -712,11 +762,15 @@ async function connectAuthHome(): Promise<void> {
       | undefined;
     if (msg.method === "join_password_auth_confirm") {
       const row = (payload as { pending?: PasswordAuthRequestPayload[] } | undefined)?.pending?.[0];
-      if (row) void chrome.storage.local.set({ yadaPendingAuth: row, yadaPendingHome: base });
+      if (row) {
+        void chrome.storage.local.set({ yadaPendingAuth: row, yadaPendingHome: base });
+        void chrome.action.setBadgeText({ text: "1" });
+      }
       return;
     }
     if (msg.method === "password_auth_request" && payload && "session_id" in payload) {
       void chrome.storage.local.set({ yadaPendingAuth: payload, yadaPendingHome: base });
+      void chrome.action.setBadgeText({ text: "1" });
     }
     if (msg.method === "wyda_swap_request" && payload && "session_id" in payload) {
       if ((payload as { permit_signed?: boolean }).permit_signed) return;
@@ -726,6 +780,33 @@ async function connectAuthHome(): Promise<void> {
   ws.onclose = () => {
     if (authWs === ws) authWs = null;
   };
+}
+
+async function connectAuthHome(): Promise<void> {
+  await loadForcedAuthHome();
+  const v = await loadVault();
+  if (!v?.inceptionDone || !v.username) return;
+  const username = v.username.replace(/^@/, "");
+  const forced =
+    forcedAuthHome &&
+    forcedAuthHome.username.toLowerCase() === username.toLowerCase()
+      ? forcedAuthHome.base
+      : "";
+  let base = forced;
+  if (!base) {
+    const pageOrigin = await activePageOrigin();
+    base = await resolveHomeApiBase({
+      username: v.username,
+      pageOrigin: pageOrigin || undefined,
+      cachedHome:
+        v.nodeUrl && pageOrigin && v.nodeUrl.replace(/\/+$/, "").toLowerCase() === pageOrigin
+          ? undefined
+          : v.nodeUrl,
+      requestPermission: false,
+    });
+  }
+  if (!base) return;
+  await connectAuthSocket(base);
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -791,6 +872,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     void chrome.action.setBadgeText({ text: "1" });
     sendResponse({ ok: true });
     return false;
+  }
+
+  if (message.type === "YADA_USE_AUTH_HOME") {
+    void (async () => {
+      const home = normalizeNodeBaseUrl(String(message.home || ""));
+      if (!home) {
+        sendResponse({ ok: false, message: "invalid home node" });
+        return;
+      }
+      try {
+        const v = await loadVault();
+        if (v?.username) {
+          const username = v.username.replace(/^@/, "");
+          forcedAuthHome = { username, base: home };
+          forcedAuthHomeLoaded = true;
+          rememberHome(username, home);
+          await chrome.storage.local.set({ yadaAuthHome: { username, home } });
+        }
+        await connectAuthSocket(home);
+        sendResponse({ ok: true, home });
+      } catch (e) {
+        sendResponse({ ok: false, message: e instanceof Error ? e.message : String(e) });
+      }
+    })();
+    return true;
   }
 
   if (message.type === "YADA_REGISTER_SITE") {
@@ -1025,6 +1131,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           extVersion: EXT_VERSION,
           canCreateVault: true,
         });
+        void connectAuthHome().catch(() => {});
       } catch (e) {
         sendResponse({
           ok: false,
@@ -1059,6 +1166,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             inceptionDone: !!done.vault.inceptionDone,
             inceptionError: done.error,
           });
+          void connectAuthHome().catch(() => {});
           return;
         }
         const mnemonic = createVaultSeed(128);
@@ -1091,6 +1199,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           inceptionDone: !!stored.inceptionDone,
           inceptionError: incepted.error,
         });
+        void connectAuthHome().catch(() => {});
       } catch (e) {
         sendResponse({
           ok: false,
@@ -1113,6 +1222,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         if (v.inceptionDone) {
           sendResponse({ ok: true, inceptionDone: true, username: (v.username || "").replace(/^@/, "") });
+          void connectAuthHome().catch(() => {});
           return;
         }
         const done = await broadcastInceptionFor(
@@ -1127,6 +1237,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           username: (done.vault.username || "").replace(/^@/, ""),
           baseAddress: baseReceiveAddress(done.vault.mnemonic),
         });
+        void connectAuthHome().catch(() => {});
       } catch (e) {
         sendResponse({ ok: false, message: e instanceof Error ? e.message : String(e) });
       }
@@ -1367,3 +1478,5 @@ void chrome.storage.local.get("yadaLastUnwrap").then((stored) => {
     burn: last.burn,
   }, false);
 });
+
+void connectAuthHome().catch(() => {});

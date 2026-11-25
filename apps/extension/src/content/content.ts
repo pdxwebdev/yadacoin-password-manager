@@ -66,6 +66,18 @@ window.addEventListener("message", (event) => {
     });
   }
 
+  if (data.type === "YADA_PASSWORD_USE_HOME") {
+    chrome.runtime.sendMessage(
+      {
+        type: "YADA_USE_AUTH_HOME",
+        home: String(data.home || ""),
+      },
+      () => {
+        void chrome.runtime.lastError;
+      }
+    );
+  }
+
   if (data.type === "YADA_PASSWORD_CLIENT") {
     const requestId = data.requestId;
     chrome.runtime.sendMessage(

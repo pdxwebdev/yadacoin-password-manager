@@ -175,7 +175,8 @@ export async function fetchPendingAuthSessions(
 
 export async function getPasswordHome(
   nodeUrl: string,
-  username: string
+  username: string,
+  usernameSignature?: string
 ): Promise<{
   status: boolean;
   node_http_base?: string;
@@ -189,10 +190,10 @@ export async function getPasswordHome(
   deterministic_node_http_base?: string;
   tried?: string[];
 }> {
+  const params = new URLSearchParams({ username });
+  if (usernameSignature) params.set("username_signature", usernameSignature);
   const { body } = await jsonFetch(
-    base(nodeUrl) +
-      "/password-rotation/home?username=" +
-      encodeURIComponent(username)
+    base(nodeUrl) + "/password-rotation/home?" + params.toString()
   );
   return body;
 }
@@ -203,7 +204,8 @@ export async function getPasswordHome(
  */
 export async function resolvePasswordHome(
   entryNodeUrl: string,
-  username: string
+  username: string,
+  usernameSignature?: string
 ): Promise<{
   status: boolean;
   node_http_base?: string;
@@ -213,7 +215,7 @@ export async function resolvePasswordHome(
   deterministic_node_http_base?: string;
   tried?: string[];
 }> {
-  return getPasswordHome(entryNodeUrl, username);
+  return getPasswordHome(entryNodeUrl, username, usernameSignature);
 }
 
 export async function publishPasswordHome(

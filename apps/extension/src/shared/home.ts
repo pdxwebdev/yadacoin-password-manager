@@ -17,6 +17,13 @@ const HOME_CACHE_MS = 5 * 60 * 1000;
 /** Do not walk the full topology. One entry node resolves the home SP. */
 const TOPOLOGY_FAILOVER_CAP = 4;
 
+export function rememberHome(username: string, baseUrl: string): void {
+  const user = (username || "").trim().toLowerCase();
+  const base = normalizeNodeBaseUrl(baseUrl);
+  if (!user || !base) return;
+  homeCache.set(user, { base, at: Date.now() });
+}
+
 const chromeTopologyStore: TopologyCacheStore = {
   async get(key) {
     if (typeof chrome === "undefined" || !chrome.storage?.local) return null;
