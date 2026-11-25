@@ -233,7 +233,7 @@ async function broadcastInceptionFor(
   }
 }
 
-const EXT_VERSION = "0.1.37";
+const EXT_VERSION = "0.1.38";
 
 function sameNode(a: string, b: string): boolean {
   return a.replace(/\/+$/, "").toLowerCase() === b.replace(/\/+$/, "").toLowerCase();
