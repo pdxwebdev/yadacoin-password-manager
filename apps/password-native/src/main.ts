@@ -31,6 +31,7 @@ import {
   rotateSitePassword,
   siteForSignIn,
   signPasswordHomeClaim,
+  passwordAuthPresenceProof,
   siteAtCounter,
   siteKeysForOrigin,
   unlockIdentity,
@@ -340,17 +341,38 @@ function setTab(name: string) {
   $("panel-request").hidden = name !== "request";
 }
 
+const CODE_ACTIONS = new Set(["operator", "signin", "register"]);
+
+function nativeNeedsCode(): boolean {
+  return (
+    !!pending &&
+    pending.source === "remote" &&
+    CODE_ACTIONS.has(String(pending.action || "").toLowerCase())
+  );
+}
+
+function nativeCodeValue(): string {
+  const el = $("reqCode") as HTMLInputElement | null;
+  return (el?.value || "").replace(/\D/g, "").slice(0, 6);
+}
+
+function updateNativeApprove(): void {
+  if (!pending || pending.source !== "remote") return;
+  const approve = $("approveBtn") as HTMLButtonElement;
+  approve.disabled = nativeNeedsCode() ? nativeCodeValue().length !== 6 : false;
+}
+
 function setVerifyUi(v: VerifyCallerResult | null, caller: AttestedCaller | null) {
   const badge = $("reqVerify");
   const callerEl = $("reqCaller");
   const certEl = $("reqCert");
   const approve = $("approveBtn") as HTMLButtonElement;
   if (pending?.source === "remote") {
-    badge.textContent = "Remote session · confirm site origin below";
+    badge.textContent = "Remote session · enter the code shown in the browser";
     badge.className = "mono pm-verify pm-verify--ok";
     callerEl.textContent = "WebView / network handoff";
     certEl.textContent = pending.sessionId || "—";
-    approve.disabled = false;
+    updateNativeApprove();
     return;
   }
   if (!v) {
@@ -386,6 +408,16 @@ function setVerifyUi(v: VerifyCallerResult | null, caller: AttestedCaller | null
 
 function showPending(req: BridgeRequest | null) {
   pending = req;
+  const codeField = $("reqCodeField") as HTMLElement | null;
+  const codeInput = $("reqCode") as HTMLInputElement | null;
+  if (codeInput) codeInput.value = "";
+  if (codeField) {
+    codeField.hidden = !(
+      req &&
+      req.source === "remote" &&
+      CODE_ACTIONS.has(String(req.action || "").toLowerCase())
+    );
+  }
   if (!req) {
     pendingCaller = null;
     pendingVerify = null;
@@ -476,6 +508,9 @@ async function respond(result: BridgeResult, _callback: string) {
     }
     const resultBody = {
       result_token: req.resultToken,
+      ...(result.verification_code
+        ? { verification_code: result.verification_code }
+        : {}),
       ok: result.ok,
       deny: !result.ok,
       action: result.action,
@@ -606,12 +641,19 @@ async function drainPendingRemote(v: StoredVault): Promise<void> {
   if (!nodeUrl || !v.inceptionDone) return;
   try {
     const id = identityFromVault(v);
-    const rows = await fetchPendingAuthSessions(nodeUrl, {
-      username: id.username,
-      username_signature: id.usernameSignature,
-      public_key: id.k0.publicKeyHex,
-      inception_pkh: id.k0.address,
-    });
+    const rows = await fetchPendingAuthSessions(
+      nodeUrl,
+      {
+        username: id.username,
+        username_signature: id.usernameSignature,
+        public_key: id.k0.publicKeyHex,
+        inception_pkh: id.k0.address,
+      },
+      {
+        username: id.username,
+        privateKey: id.k0.privateKey,
+      }
+    );
     for (const row of rows) {
       await ingestRemoteAuth(row);
       break;
@@ -851,7 +893,10 @@ async function ensureAuthWs(): Promise<void> {
         authWsFailCount = 0;
         authWsBackoffMs = 4000;
         setPresenceUi("online");
-        send("join_password_auth", {});
+        send(
+          "join_password_auth",
+          passwordAuthPresenceProof(id.username, id.k0.privateKey)
+        );
         void publishHomeClaim(v);
         void drainPendingRemote(v);
         return;
@@ -1012,6 +1057,12 @@ async function approvePending() {
   alertMsg("Working…", "success");
   try {
     const isRemote = req.source === "remote";
+    const verificationCode = nativeCodeValue();
+    if (isRemote && nativeNeedsCode() && verificationCode.length !== 6) {
+      alertMsg("Enter the 6-digit code shown in the requesting browser.", "error");
+      updateNativeApprove();
+      return;
+    }
     if (nativePlatform() && !isRemote && !pendingVerify?.ok) {
       alertMsg(`Caller not verified: ${pendingVerify?.reason || "unknown"}`, "error");
       return;
@@ -1174,6 +1225,9 @@ async function approvePending() {
           counter: result.site.counter,
           password: result.site.currentPassword,
           nextPasswordHash: hashPassword(result.site.currentPassword),
+          ...(isRemote && nativeNeedsCode()
+            ? { verification_code: verificationCode }
+            : {}),
           message: `registered · counter ${result.site.counter}`,
         },
         req.callback
@@ -1211,6 +1265,9 @@ async function approvePending() {
           counter: result.site.counter,
           password: result.site.currentPassword,
           nextPasswordHash: hashPassword(result.site.currentPassword),
+          ...(isRemote && nativeNeedsCode()
+            ? { verification_code: verificationCode }
+            : {}),
           message:
             req.action === "operator"
               ? `operator approved · counter ${result.site.counter}`
@@ -1475,6 +1532,11 @@ async function main() {
     }
   });
 
+  ($("reqCode") as HTMLInputElement | null)?.addEventListener("input", (e) => {
+    const el = e.target as HTMLInputElement;
+    el.value = (el.value || "").replace(/\D/g, "").slice(0, 6);
+    updateNativeApprove();
+  });
   $("approveBtn").addEventListener("click", () => void approvePending());
   $("denyBtn").addEventListener("click", () => {
     if (!pending) return;

@@ -10765,6 +10765,9 @@ async function jsonFetch(url, init) {
 async function postAuthSessionResult(nodeUrl, sessionId, result) {
   const { ok, status, body } = await jsonFetch(base(nodeUrl) + "/password-rotation/auth-session/" + encodeURIComponent(sessionId) + "/result", {
     method: "POST",
+    // Send the browser's yada_signin_bind cookie so operator approvals are
+    // checked against the browser that created the request.
+    credentials: "include",
     body: JSON.stringify(result)
   });
   if (!ok || body?.status === false || body?.ok === false) {
@@ -10772,7 +10775,19 @@ async function postAuthSessionResult(nodeUrl, sessionId, result) {
   }
   return body;
 }
-async function fetchPendingAuthSessions(nodeUrl, q) {
+function passwordAuthPresenceMessage(username, timestamp) {
+  return `password-auth-presence|${username}|${timestamp}`;
+}
+function passwordAuthPresenceProof(username, privateKey, timestamp = Math.floor(Date.now() / 1e3)) {
+  return {
+    timestamp,
+    signature: signMessage(passwordAuthPresenceMessage(username, timestamp), privateKey)
+  };
+}
+function passwordAuthPendingMessage(username, timestamp) {
+  return `password-auth-pending|${username}|${timestamp}`;
+}
+async function fetchPendingAuthSessions(nodeUrl, q, proof) {
   const params = new URLSearchParams();
   if (q.username)
     params.set("username", q.username);
@@ -10782,6 +10797,11 @@ async function fetchPendingAuthSessions(nodeUrl, q) {
     params.set("public_key", q.public_key);
   if (q.inception_pkh)
     params.set("inception_pkh", q.inception_pkh);
+  if (proof?.username && proof.privateKey) {
+    const ts = proof.timestamp ?? Math.floor(Date.now() / 1e3);
+    params.set("timestamp", String(ts));
+    params.set("signature", signMessage(passwordAuthPendingMessage(proof.username, ts), proof.privateKey));
+  }
   const { body } = await jsonFetch(base(nodeUrl) + "/password-rotation/auth-session/pending?" + params.toString());
   return body?.pending || [];
 }
@@ -11271,17 +11291,30 @@ function setTab(name) {
   $("panel-vault").hidden = name !== "vault";
   $("panel-request").hidden = name !== "request";
 }
+var CODE_ACTIONS = /* @__PURE__ */ new Set(["operator", "signin", "register"]);
+function nativeNeedsCode() {
+  return !!pending && pending.source === "remote" && CODE_ACTIONS.has(String(pending.action || "").toLowerCase());
+}
+function nativeCodeValue() {
+  const el = $("reqCode");
+  return (el?.value || "").replace(/\D/g, "").slice(0, 6);
+}
+function updateNativeApprove() {
+  if (!pending || pending.source !== "remote") return;
+  const approve = $("approveBtn");
+  approve.disabled = nativeNeedsCode() ? nativeCodeValue().length !== 6 : false;
+}
 function setVerifyUi(v, caller) {
   const badge = $("reqVerify");
   const callerEl = $("reqCaller");
   const certEl = $("reqCert");
   const approve = $("approveBtn");
   if (pending?.source === "remote") {
-    badge.textContent = "Remote session \xB7 confirm site origin below";
+    badge.textContent = "Remote session \xB7 enter the code shown in the browser";
     badge.className = "mono pm-verify pm-verify--ok";
     callerEl.textContent = "WebView / network handoff";
     certEl.textContent = pending.sessionId || "\u2014";
-    approve.disabled = false;
+    updateNativeApprove();
     return;
   }
   if (!v) {
@@ -11308,6 +11341,12 @@ function setVerifyUi(v, caller) {
 }
 function showPending(req) {
   pending = req;
+  const codeField = $("reqCodeField");
+  const codeInput = $("reqCode");
+  if (codeInput) codeInput.value = "";
+  if (codeField) {
+    codeField.hidden = !(req && req.source === "remote" && CODE_ACTIONS.has(String(req.action || "").toLowerCase()));
+  }
   if (!req) {
     pendingCaller = null;
     pendingVerify = null;
@@ -11383,6 +11422,7 @@ async function respond(result, _callback) {
     }
     const resultBody = {
       result_token: req.resultToken,
+      ...result.verification_code ? { verification_code: result.verification_code } : {},
       ok: result.ok,
       deny: !result.ok,
       action: result.action,
@@ -11501,12 +11541,19 @@ async function drainPendingRemote(v) {
   if (!nodeUrl || !v.inceptionDone) return;
   try {
     const id = identityFromVault(v);
-    const rows = await fetchPendingAuthSessions(nodeUrl, {
-      username: id.username,
-      username_signature: id.usernameSignature,
-      public_key: id.k0.publicKeyHex,
-      inception_pkh: id.k0.address
-    });
+    const rows = await fetchPendingAuthSessions(
+      nodeUrl,
+      {
+        username: id.username,
+        username_signature: id.usernameSignature,
+        public_key: id.k0.publicKeyHex,
+        inception_pkh: id.k0.address
+      },
+      {
+        username: id.username,
+        privateKey: id.k0.privateKey
+      }
+    );
     for (const row of rows) {
       await ingestRemoteAuth(row);
       break;
@@ -11721,7 +11768,10 @@ async function ensureAuthWs() {
         authWsFailCount = 0;
         authWsBackoffMs = 4e3;
         setPresenceUi("online");
-        send("join_password_auth", {});
+        send(
+          "join_password_auth",
+          passwordAuthPresenceProof(id.username, id.k0.privateKey)
+        );
         void publishHomeClaim(v);
         void drainPendingRemote(v);
         return;
@@ -11860,6 +11910,12 @@ async function approvePending() {
   alertMsg("Working\u2026", "success");
   try {
     const isRemote = req.source === "remote";
+    const verificationCode = nativeCodeValue();
+    if (isRemote && nativeNeedsCode() && verificationCode.length !== 6) {
+      alertMsg("Enter the 6-digit code shown in the requesting browser.", "error");
+      updateNativeApprove();
+      return;
+    }
     if (nativePlatform() && !isRemote && !pendingVerify?.ok) {
       alertMsg(`Caller not verified: ${pendingVerify?.reason || "unknown"}`, "error");
       return;
@@ -12013,6 +12069,7 @@ async function approvePending() {
           counter: result.site.counter,
           password: result.site.currentPassword,
           nextPasswordHash: hashPassword(result.site.currentPassword),
+          ...isRemote && nativeNeedsCode() ? { verification_code: verificationCode } : {},
           message: `registered \xB7 counter ${result.site.counter}`
         },
         req.callback
@@ -12047,6 +12104,7 @@ async function approvePending() {
           counter: result.site.counter,
           password: result.site.currentPassword,
           nextPasswordHash: hashPassword(result.site.currentPassword),
+          ...isRemote && nativeNeedsCode() ? { verification_code: verificationCode } : {},
           message: req.action === "operator" ? `operator approved \xB7 counter ${result.site.counter}` : `signed in & rotated \xB7 counter ${result.site.counter}`
         },
         req.callback
@@ -12287,6 +12345,11 @@ async function main() {
     } catch (e) {
       alertMsg(e instanceof Error ? e.message : String(e), "error");
     }
+  });
+  $("reqCode")?.addEventListener("input", (e) => {
+    const el = e.target;
+    el.value = (el.value || "").replace(/\D/g, "").slice(0, 6);
+    updateNativeApprove();
   });
   $("approveBtn").addEventListener("click", () => void approvePending());
   $("denyBtn").addEventListener("click", () => {

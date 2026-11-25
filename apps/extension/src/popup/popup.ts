@@ -74,6 +74,58 @@ async function getActiveOrigin(): Promise<string> {
   }
 }
 
+interface ActiveAuthSession {
+  session_id: string;
+  origin: string;
+  at?: number;
+  /** Present only when the extension is running in the requesting browser. */
+  rp_token?: string;
+}
+
+const ACTIVE_AUTH_STORAGE_KEY = "yadaActiveAuthSession";
+let activeAuthRpToken = "";
+const ACTIVE_AUTH_MAX_AGE_MS = 6 * 60 * 1000;
+
+/** Session the active tab explicitly started; only that one may be approved. */
+async function getActiveAuthSession(): Promise<ActiveAuthSession | null> {
+  try {
+    if (
+      typeof chrome === "undefined" ||
+      !chrome.tabs?.query ||
+      !chrome.scripting?.executeScript
+    ) {
+      return null;
+    }
+    const tabs = await chrome.tabs.query({
+      active: true,
+      lastFocusedWindow: true,
+    });
+    const tab = tabs.find((t) => t.id != null && t.url && /^https?:/i.test(t.url));
+    if (!tab?.id || !tab.url) return null;
+    const tabOrigin = new URL(tab.url).origin.toLowerCase();
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: (key: string) => {
+        try {
+          return sessionStorage.getItem(key) || "";
+        } catch {
+          return "";
+        }
+      },
+      args: [ACTIVE_AUTH_STORAGE_KEY],
+    });
+    const raw = typeof results?.[0]?.result === "string" ? results[0].result : "";
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as ActiveAuthSession;
+    if (!parsed?.session_id || !parsed?.origin) return null;
+    if ((parsed.origin || "").toLowerCase() !== tabOrigin) return null;
+    if (parsed.at && Date.now() - parsed.at > ACTIVE_AUTH_MAX_AGE_MS) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 async function fillSiteFromOrigin(origin: string, vault: StoredVault | null) {
   if (!origin) return;
   const key = normalizeSiteId(origin);
@@ -276,6 +328,28 @@ async function markSwapHandled(sessionId: string | undefined): Promise<void> {
   await chrome.storage.local.set({ yadaFulfilledSwaps: ids.slice(-100) });
 }
 
+const CODE_ACTIONS = new Set(["operator", "signin", "register"]);
+
+function authNeedsCode(p: PasswordAuthRequestPayload | null): boolean {
+  if (!p || !CODE_ACTIONS.has(String(p.action || "").toLowerCase())) return false;
+  // Same-browser approvals present the tab's rp_token instead of the code.
+  return !activeAuthRpToken;
+}
+
+function authCodeValue(): string {
+  const el = $("authCode") as HTMLInputElement | null;
+  return (el?.value || "").replace(/\D/g, "").slice(0, 6);
+}
+
+function updateApproveEnabled(p: PasswordAuthRequestPayload | null): void {
+  const approve = $("approveRequestBtn") as HTMLButtonElement;
+  if (!p) {
+    approve.disabled = true;
+    return;
+  }
+  approve.disabled = authNeedsCode(p) ? authCodeValue().length !== 6 : false;
+}
+
 function renderPendingRequest(
   p: PasswordAuthRequestPayload | null,
   nodeUrl = ""
@@ -285,6 +359,16 @@ function renderPendingRequest(
   const summary = $("requestSummary");
   const approve = $("approveRequestBtn") as HTMLButtonElement;
   const deny = $("denyRequestBtn") as HTMLButtonElement;
+  const codeField = $("authCodeField") as HTMLElement | null;
+  const codeInput = $("authCode") as HTMLInputElement | null;
+  const sameBrowser = $("authSameBrowser") as HTMLElement | null;
+  if (codeField) codeField.hidden = !authNeedsCode(p);
+  if (sameBrowser) {
+    sameBrowser.hidden = !(
+      p && CODE_ACTIONS.has(String(p.action || "").toLowerCase()) && !authNeedsCode(p)
+    );
+  }
+  if (codeInput) codeInput.value = "";
   if (!p) {
     if (!pendingSwap && !pendingUnwrap) {
       summary.textContent = "No pending request";
@@ -304,7 +388,8 @@ function renderPendingRequest(
   ]
     .filter(Boolean)
     .join("\n");
-  approve.disabled = false;
+  // Approve stays disabled until the 6-digit code from the browser is entered.
+  updateApproveEnabled(p);
   deny.disabled = false;
 }
 
@@ -368,13 +453,17 @@ async function drainPendingRequests(): Promise<void> {
     return;
   }
   const pageOrigin = await getActiveOrigin();
+  const active = await getActiveAuthSession();
   const stored = await chrome.storage.local.get(["yadaPendingAuth", "yadaPendingHome"]);
   const storedSite = String(stored.yadaPendingAuth?.site || "");
   const storedMatchesPage =
-    !pageOrigin ||
-    !storedSite.startsWith("http") ||
-    sameNode(storedSite, pageOrigin);
+    (!pageOrigin ||
+      !storedSite.startsWith("http") ||
+      sameNode(storedSite, pageOrigin)) &&
+    !!active &&
+    active.session_id === stored.yadaPendingAuth?.session_id;
   if (stored.yadaPendingAuth?.session_id && storedMatchesPage) {
+    activeAuthRpToken = active?.rp_token || "";
     renderPendingRequest(stored.yadaPendingAuth, stored.yadaPendingHome || "");
     showAlert(`Pending ${stored.yadaPendingAuth.action} for ${stored.yadaPendingAuth.site}`, "success");
     setTab("request");
@@ -401,10 +490,23 @@ async function drainPendingRequests(): Promise<void> {
   for (const base of bases) {
     try {
       await ensureNodeAccess(base);
-      const rows = await fetchPendingAuthSessions(base, q);
+      const rows = await fetchPendingAuthSessions(
+        base,
+        q,
+        {
+          username: id.username,
+          privateKey: id.k0.privateKey,
+        }
+      );
       checked++;
-      if (rows && rows.length) {
-        first = rows[0]!;
+      // Only the request the active tab started is approvable. This prevents
+      // a request planted by another browser from being approved here.
+      const match = active
+        ? (rows || []).find((r) => r.session_id === active.session_id)
+        : null;
+      if (match) {
+        first = match;
+        activeAuthRpToken = active?.rp_token || "";
         from = base.replace(/\/+$/, "");
         break;
       }
@@ -488,9 +590,25 @@ async function approvePendingRequest(): Promise<void> {
     return;
   }
   if (!pendingRemote) return;
+  const active = await getActiveAuthSession();
+  if (!active || active.session_id !== pendingRemote.session_id) {
+    pendingRemote = null;
+    renderPendingRequest(null);
+    showAlert(
+      "This request was not started in the active tab. Open the page that started sign-in and approve there.",
+      "error"
+    );
+    return;
+  }
+  const verificationCode = authCodeValue();
+  if (authNeedsCode(pendingRemote) && verificationCode.length !== 6) {
+    showAlert("Enter the 6-digit code shown in the requesting browser.", "error");
+    return;
+  }
   const p = pendingRemote;
   const nodeUrl = pendingNodeUrl;
   const pageOrigin = await getActiveOrigin();
+  const sameBrowser = !!activeAuthRpToken;
   setApproveBusy(true);
   showAlert("Approving…", "success");
   const res = (await chrome.runtime.sendMessage({
@@ -498,6 +616,8 @@ async function approvePendingRequest(): Promise<void> {
     request: p,
     pendingNodeUrl: nodeUrl,
     pageOrigin,
+    verificationCode,
+    rpToken: sameBrowser ? activeAuthRpToken : "",
   })) as { ok?: boolean; message?: string } | undefined;
   if (chrome.runtime.lastError) {
     throw new Error(chrome.runtime.lastError.message || "approve failed");
@@ -545,6 +665,16 @@ async function denyPendingRequest(): Promise<void> {
     return;
   }
   if (!pendingRemote) return;
+  const active = await getActiveAuthSession();
+  if (!active || active.session_id !== pendingRemote.session_id) {
+    pendingRemote = null;
+    renderPendingRequest(null);
+    showAlert(
+      "This request was not started in the active tab. Open the page that started sign-in and deny there.",
+      "error"
+    );
+    return;
+  }
   const p = pendingRemote;
   const v = await loadVault();
   const nodeUrl =
@@ -751,7 +881,13 @@ async function main() {
     });
   }
 
+  ($("authCode") as HTMLInputElement | null)?.addEventListener("input", (e) => {
+    const el = e.target as HTMLInputElement;
+    el.value = (el.value || "").replace(/\D/g, "").slice(0, 6);
+    updateApproveEnabled(pendingRemote);
+  });
   $("refreshRequestBtn").addEventListener("click", () => {
+    activeAuthRpToken = "";
     void drainPendingRequests().catch((e) =>
       showAlert(e instanceof Error ? e.message : String(e), "error")
     );

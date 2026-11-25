@@ -15,6 +15,7 @@ import {
   nodeUrlToWebSocketUrl,
   normalizeNodeBaseUrl,
   normalizeSiteId,
+  passwordAuthPresenceProof,
   postAuthSessionResult,
   registerSite,
   resyncSiteFromNode,
@@ -449,7 +450,9 @@ let approveTail: Promise<void> = Promise.resolve();
 async function approveAuthRequest(
   p: PasswordAuthRequestPayload,
   pendingNodeUrl: string,
-  pageOrigin: string
+  pageOrigin: string,
+  verificationCode = "",
+  rpToken = ""
 ): Promise<{ ok: boolean; message: string; action?: string }> {
   if (!p?.session_id) return { ok: false, message: "no pending request" };
   if (approveInFlight === p.session_id) {
@@ -576,6 +579,9 @@ async function approveAuthRequest(
     );
     const resultBody = {
       result_token: p.result_token,
+      verification_code: verificationCode,
+      // Same-browser proof: only the requesting tab received this token.
+      ...(rpToken ? { rp_token: rpToken } : {}),
       ok: true,
       action: action === "operator" ? "operator" : action === "register" ? "register" : "signin",
       nonce: p.nonce,
@@ -756,7 +762,10 @@ async function connectAuthSocket(baseUrl: string): Promise<void> {
       return;
     }
     if (msg.method === "connect_confirm") {
-      send("join_password_auth", {});
+      send(
+        "join_password_auth",
+        passwordAuthPresenceProof(identity.username, identity.k0.privateKey)
+      );
       return;
     }
     const payload = (msg.params || msg.result) as
@@ -1410,7 +1419,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const p = message.request as PasswordAuthRequestPayload;
         const pendingNodeUrl = String(message.pendingNodeUrl || "");
         const pageOrigin = String(message.pageOrigin || "");
-        const result = await approveAuthRequest(p, pendingNodeUrl, pageOrigin);
+        const verificationCode = String(message.verificationCode || "");
+        const rpToken = String(message.rpToken || "");
+        const result = await approveAuthRequest(
+          p,
+          pendingNodeUrl,
+          pageOrigin,
+          verificationCode,
+          rpToken
+        );
         await approveTail;
         return result;
       } catch (e) {

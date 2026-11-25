@@ -49,6 +49,8 @@ export interface BridgeResult {
   username?: string;
   /** K0 address. Public. Client sign-in only. */
   identity?: string;
+  /** Code shown in the requesting browser; required for remote sign-in. */
+  verification_code?: string;
 }
 
 const ACTIONS = new Set<BridgeAction>(["signin", "register", "status", "operator", "storage", "base", "client"]);

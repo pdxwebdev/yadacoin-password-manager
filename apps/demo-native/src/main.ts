@@ -172,7 +172,11 @@ async function startBridge(action: "signin" | "register" | "status") {
       if (Date.now() - started > 180000) throw new Error("timed out waiting for approval");
       await new Promise((r) => setTimeout(r, 1500));
       if (signal.aborted) throw new Error("cancelled");
-      const view = await pollAuthSession(nodeUrl, created.session_id);
+      const view = await pollAuthSession(
+        nodeUrl,
+        created.session_id,
+        created.rp_token
+      );
       const st = view.session_status;
       if (st === "pending" || st === "delivered" || st === "proxied") continue;
       applySession(action, view);

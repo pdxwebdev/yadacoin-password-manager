@@ -2579,6 +2579,7 @@ var BASE64_CODE = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456
 
 // ../../packages/core/dist/box.js
 var DOMAIN = new TextEncoder().encode("yada-pw-box-v1");
+var SIA_BOX_DOMAIN = new TextEncoder().encode("yada-sia-box-v1");
 
 // ../../packages/core/dist/vault.js
 function normalizeSiteId(siteId2) {
@@ -2635,8 +2636,11 @@ async function createAuthSession(nodeUrl, req) {
   });
   return body;
 }
-async function pollAuthSession(nodeUrl, sessionId) {
-  const { body } = await jsonFetch(base(nodeUrl) + "/password-rotation/auth-session/" + encodeURIComponent(sessionId));
+async function pollAuthSession(nodeUrl, sessionId, rpToken) {
+  const headers = {};
+  if (rpToken)
+    headers["X-Password-Auth-RP-Token"] = rpToken;
+  const { body } = await jsonFetch(base(nodeUrl) + "/password-rotation/auth-session/" + encodeURIComponent(sessionId), { headers });
   return body;
 }
 
@@ -2980,7 +2984,11 @@ async function startBridge(action) {
       if (Date.now() - started > 18e4) throw new Error("timed out waiting for approval");
       await new Promise((r) => setTimeout(r, 1500));
       if (signal.aborted) throw new Error("cancelled");
-      const view = await pollAuthSession(nodeUrl, created.session_id);
+      const view = await pollAuthSession(
+        nodeUrl,
+        created.session_id,
+        created.rp_token
+      );
       const st = view.session_status;
       if (st === "pending" || st === "delivered" || st === "proxied") continue;
       applySession(action, view);

@@ -72,6 +72,23 @@
             <label>Pending</label>
             <div class="pm-pre" id="requestSummary">No pending request</div>
           </div>
+          <div class="pm-field" id="authSameBrowser" hidden>
+            <div class="pm-muted" id="authSameBrowserText">
+              This browser started the request. Approve below.
+            </div>
+          </div>
+          <div class="pm-field" id="authCodeField" hidden>
+            <label for="authCode">Code shown in the requesting browser</label>
+            <input
+              class="pm-input"
+              id="authCode"
+              type="text"
+              inputmode="numeric"
+              autocomplete="one-time-code"
+              maxlength="6"
+              placeholder="6-digit code"
+            />
+          </div>
           <div class="pm-btn-row">
             <button type="button" class="pm-btn pm-btn--ghost" id="refreshRequestBtn">
               Refresh

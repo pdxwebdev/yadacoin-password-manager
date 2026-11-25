@@ -116,6 +116,18 @@
             <label>Identity check</label>
             <div class="mono" id="reqVerify">—</div>
           </div>
+          <div class="pm-field" id="reqCodeField" hidden>
+            <label for="reqCode">Code shown in the requesting browser</label>
+            <input
+              class="pm-input"
+              id="reqCode"
+              type="text"
+              inputmode="numeric"
+              autocomplete="one-time-code"
+              maxlength="6"
+              placeholder="6-digit code"
+            />
+          </div>
           <div class="pm-btn-row">
             <button type="button" class="pm-btn" id="approveBtn">Approve</button>
             <button type="button" class="pm-btn pm-btn--ghost" id="denyBtn">Deny</button>

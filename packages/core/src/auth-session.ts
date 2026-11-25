@@ -1,5 +1,7 @@
 /** Remote auth session (webview username handoff) HTTP helpers. */
 
+import { signMessage } from "./transaction";
+
 export type RemoteAuthAction = "signin" | "register" | "status" | "operator" | "client" | "storage";
 
 export interface CreateAuthSessionRequest {
@@ -32,6 +34,8 @@ export interface AuthSessionView {
   registered?: boolean;
   proxied?: boolean;
   token?: string;
+  /** RP read capability, returned only to the client that created the session. */
+  rp_token?: string;
   operator_session?: boolean;
   baseAddress?: string;
   identity?: string;
@@ -124,10 +128,14 @@ export async function createAuthSession(
 
 export async function pollAuthSession(
   nodeUrl: string,
-  sessionId: string
+  sessionId: string,
+  rpToken?: string
 ): Promise<AuthSessionView> {
+  const headers: Record<string, string> = {};
+  if (rpToken) headers["X-Password-Auth-RP-Token"] = rpToken;
   const { body } = await jsonFetch(
-    base(nodeUrl) + "/password-rotation/auth-session/" + encodeURIComponent(sessionId)
+    base(nodeUrl) + "/password-rotation/auth-session/" + encodeURIComponent(sessionId),
+    { headers }
   );
   return body as AuthSessionView;
 }
@@ -144,6 +152,9 @@ export async function postAuthSessionResult(
       "/result",
     {
       method: "POST",
+      // Send the browser's yada_signin_bind cookie so operator approvals are
+      // checked against the browser that created the request.
+      credentials: "include",
       body: JSON.stringify(result),
     }
   );
@@ -153,6 +164,39 @@ export async function postAuthSessionResult(
   return body as AuthSessionView;
 }
 
+export function passwordAuthPresenceMessage(
+  username: string,
+  timestamp: number
+): string {
+  return `password-auth-presence|${username}|${timestamp}`;
+}
+
+/** Fresh proof of identity-key possession for the WS join_password_auth call. */
+export function passwordAuthPresenceProof(
+  username: string,
+  privateKey: Uint8Array,
+  timestamp: number = Math.floor(Date.now() / 1000)
+): { timestamp: number; signature: string } {
+  return {
+    timestamp,
+    signature: signMessage(passwordAuthPresenceMessage(username, timestamp), privateKey),
+  };
+}
+
+/** Signed proof that the caller controls the identity key. */
+export interface PendingAuthProof {
+  username: string;
+  privateKey: Uint8Array;
+  timestamp?: number;
+}
+
+export function passwordAuthPendingMessage(
+  username: string,
+  timestamp: number
+): string {
+  return `password-auth-pending|${username}|${timestamp}`;
+}
+
 export async function fetchPendingAuthSessions(
   nodeUrl: string,
   q: {
@@ -160,13 +204,22 @@ export async function fetchPendingAuthSessions(
     username_signature?: string;
     public_key?: string;
     inception_pkh?: string;
-  }
+  },
+  proof?: PendingAuthProof
 ): Promise<PasswordAuthRequestPayload[]> {
   const params = new URLSearchParams();
   if (q.username) params.set("username", q.username);
   if (q.username_signature) params.set("username_signature", q.username_signature);
   if (q.public_key) params.set("public_key", q.public_key);
   if (q.inception_pkh) params.set("inception_pkh", q.inception_pkh);
+  if (proof?.username && proof.privateKey) {
+    const ts = proof.timestamp ?? Math.floor(Date.now() / 1000);
+    params.set("timestamp", String(ts));
+    params.set(
+      "signature",
+      signMessage(passwordAuthPendingMessage(proof.username, ts), proof.privateKey)
+    );
+  }
   const { body } = await jsonFetch(
     base(nodeUrl) + "/password-rotation/auth-session/pending?" + params.toString()
   );
@@ -248,14 +301,19 @@ export function isTerminalSessionStatus(status: string | undefined): boolean {
 export async function waitForAuthSession(
   nodeUrl: string,
   sessionId: string,
-  opts?: { intervalMs?: number; timeoutMs?: number; signal?: AbortSignal }
+  opts?: {
+    intervalMs?: number;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    rpToken?: string;
+  }
 ): Promise<AuthSessionView> {
   const interval = opts?.intervalMs ?? 1500;
   const timeout = opts?.timeoutMs ?? 180_000;
   const start = Date.now();
   while (true) {
     if (opts?.signal?.aborted) throw new Error("aborted");
-    const view = await pollAuthSession(nodeUrl, sessionId);
+    const view = await pollAuthSession(nodeUrl, sessionId, opts?.rpToken);
     if (isTerminalSessionStatus(view.session_status)) return view;
     if (Date.now() - start > timeout) {
       throw new Error("auth session timed out");
