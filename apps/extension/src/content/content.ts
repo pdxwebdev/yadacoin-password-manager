@@ -94,6 +94,7 @@ window.addEventListener("message", (event) => {
         requestId,
         username: data.username,
         secondFactor: data.secondFactor,
+        returnUrl: data.returnUrl,
         origin: window.location.origin,
       },
       (response) => {
@@ -118,6 +119,7 @@ window.addEventListener("message", (event) => {
       {
         type: "YADA_INCEPT_VAULT",
         requestId,
+        returnUrl: data.returnUrl,
         origin: window.location.origin,
       },
       (response) => {

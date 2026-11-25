@@ -158,12 +158,15 @@ async function refreshInception(
 /**
  * Broadcast inception for a stored vault if it is not on the home SP yet.
  * Resolves home, refreshes from the node, and broadcasts the inception txn.
- * Returns the (possibly updated) vault plus a human-readable error when the
- * broadcast could not be completed.
+ * The signed txn is also sent to the return-node origin (where the user will
+ * sign in) so that node's mempool sees the identity without waiting for
+ * block propagation. Returns the (possibly updated) vault plus a
+ * human-readable error when no node accepted the broadcast.
  */
 async function broadcastInceptionFor(
   v: StoredVault,
-  pageOrigin?: string
+  pageOrigin?: string,
+  returnUrl?: string
 ): Promise<{ vault: StoredVault; error: string }> {
   try {
     const base = await resolveHomeApiBase({
@@ -181,9 +184,28 @@ async function broadcastInceptionFor(
       tipPrevPkh: next.tipPrevPkh,
     });
     const txn = buildInceptionTxn(identity);
-    const res = await broadcastTxns({ baseUrl: base }, txn);
-    const already = isAlreadyInceptedError(res.body?.message);
-    if (res.ok || already) {
+    const targets: string[] = [];
+    const addTarget = (raw?: string) => {
+      const originBase = normalizeNodeBaseUrl(raw || "");
+      if (!originBase || !/^https?:\/\//i.test(originBase)) return;
+      if (!targets.some((t) => sameNode(t, originBase))) targets.push(originBase);
+    };
+    addTarget(base);
+    addTarget(returnUrl);
+    const results = await Promise.all(
+      targets.map(async (target) => {
+        try {
+          const res = await broadcastTxns({ baseUrl: target }, txn);
+          return { target, res, error: "" };
+        } catch (e) {
+          return { target, res: null, error: e instanceof Error ? e.message : String(e) };
+        }
+      })
+    );
+    const accepted = results.find(
+      (r) => r.res && (r.res.ok || isAlreadyInceptedError(r.res.body?.message))
+    );
+    if (accepted) {
       const after = identityAfterInception(identity);
       next = {
         ...next,
@@ -197,16 +219,21 @@ async function broadcastInceptionFor(
     }
     next = { ...next, nodeUrl: base };
     await saveVault(next);
-    return {
-      vault: next,
-      error: String(res.body?.message || res.body?.error?.message || `inception failed (${res.status})`),
-    };
+    const failed = results.find((r) => r.res) || results.find((r) => r.error);
+    const message = failed?.res
+      ? String(
+          failed.res.body?.message ||
+            failed.res.body?.error?.message ||
+            `inception failed (${failed.res.status})`
+        )
+      : failed?.error || "inception broadcast failed";
+    return { vault: next, error: message };
   } catch (e) {
     return { vault: v, error: e instanceof Error ? e.message : String(e) };
   }
 }
 
-const EXT_VERSION = "0.1.36";
+const EXT_VERSION = "0.1.37";
 
 function sameNode(a: string, b: string): boolean {
   return a.replace(/\/+$/, "").toLowerCase() === b.replace(/\/+$/, "").toLowerCase();
@@ -1020,9 +1047,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const existing = await loadVault();
         if (existing?.mnemonic) {
           const origin = String(message.origin || "");
+          const returnUrl = String(message.returnUrl || "");
           const done = existing.inceptionDone
             ? { vault: existing, error: "" }
-            : await broadcastInceptionFor(existing, origin);
+            : await broadcastInceptionFor(existing, origin, returnUrl);
           sendResponse({
             ok: true,
             existing: true,
@@ -1048,7 +1076,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         };
         await store.saveVault(vaultId, stored, { name: username });
         await store.setActiveVaultId(vaultId);
-        const incepted = await broadcastInceptionFor(stored, String(message.origin || ""));
+        const incepted = await broadcastInceptionFor(
+          stored,
+          String(message.origin || ""),
+          String(message.returnUrl || "")
+        );
         stored = incepted.vault;
         sendResponse({
           ok: true,
@@ -1083,7 +1115,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ ok: true, inceptionDone: true, username: (v.username || "").replace(/^@/, "") });
           return;
         }
-        const done = await broadcastInceptionFor(v, String(message.origin || ""));
+        const done = await broadcastInceptionFor(
+          v,
+          String(message.origin || ""),
+          String(message.returnUrl || "")
+        );
         sendResponse({
           ok: true,
           inceptionDone: !!done.vault.inceptionDone,
