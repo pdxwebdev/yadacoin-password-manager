@@ -155,7 +155,58 @@ async function refreshInception(
   return next;
 }
 
-const EXT_VERSION = "0.1.35";
+/**
+ * Broadcast inception for a stored vault if it is not on the home SP yet.
+ * Resolves home, refreshes from the node, and broadcasts the inception txn.
+ * Returns the (possibly updated) vault plus a human-readable error when the
+ * broadcast could not be completed.
+ */
+async function broadcastInceptionFor(
+  v: StoredVault,
+  pageOrigin?: string
+): Promise<{ vault: StoredVault; error: string }> {
+  try {
+    const base = await resolveHomeApiBase({
+      username: v.username,
+      pageOrigin,
+      cachedHome: v.nodeUrl,
+      requestPermission: false,
+    });
+    if (!base) return { vault: v, error: "could not resolve password home SP" };
+    let next = await refreshInception(v, base);
+    if (next.inceptionDone) return { vault: next, error: "" };
+    const identity = unlockIdentity(next.mnemonic, next.secondFactor, next.username, {
+      identityType: next.identityType,
+      mainDepth: next.mainDepth,
+      tipPrevPkh: next.tipPrevPkh,
+    });
+    const txn = buildInceptionTxn(identity);
+    const res = await broadcastTxns({ baseUrl: base }, txn);
+    const already = isAlreadyInceptedError(res.body?.message);
+    if (res.ok || already) {
+      const after = identityAfterInception(identity);
+      next = {
+        ...next,
+        nodeUrl: base,
+        mainDepth: after.mainDepth,
+        tipPrevPkh: after.tipPrevPkh,
+        inceptionDone: true,
+      };
+      await saveVault(next);
+      return { vault: next, error: "" };
+    }
+    next = { ...next, nodeUrl: base };
+    await saveVault(next);
+    return {
+      vault: next,
+      error: String(res.body?.message || res.body?.error?.message || `inception failed (${res.status})`),
+    };
+  } catch (e) {
+    return { vault: v, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+const EXT_VERSION = "0.1.36";
 
 function sameNode(a: string, b: string): boolean {
   return a.replace(/\/+$/, "").toLowerCase() === b.replace(/\/+$/, "").toLowerCase();
@@ -943,6 +994,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           username: (v.username || "").replace(/^@/, ""),
           identity: vaultIdFromData(v),
           baseAddress: address,
+          inceptionDone: !!v.inceptionDone,
           extVersion: EXT_VERSION,
           canCreateVault: true,
         });
@@ -967,12 +1019,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (!secondFactor) throw new Error("master password required");
         const existing = await loadVault();
         if (existing?.mnemonic) {
+          const origin = String(message.origin || "");
+          const done = existing.inceptionDone
+            ? { vault: existing, error: "" }
+            : await broadcastInceptionFor(existing, origin);
           sendResponse({
             ok: true,
             existing: true,
             username: (existing.username || "").replace(/^@/, ""),
             baseAddress: baseReceiveAddress(existing.mnemonic),
-            inceptionDone: !!existing.inceptionDone,
+            inceptionDone: !!done.vault.inceptionDone,
+            inceptionError: done.error,
           });
           return;
         }
@@ -991,37 +1048,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         };
         await store.saveVault(vaultId, stored, { name: username });
         await store.setActiveVaultId(vaultId);
-        try {
-          const base = await resolveHomeApiBase({
-            username,
-            pageOrigin: String(message.origin || ""),
-            requestPermission: false,
-          });
-          if (base) {
-            stored = await refreshInception(stored, base);
-            if (!stored.inceptionDone) {
-              const txn = buildInceptionTxn(identity);
-              const res = await broadcastTxns({ baseUrl: base }, txn);
-              const already = isAlreadyInceptedError(res.body?.message);
-              if (res.ok || already) {
-                const after = identityAfterInception(identity);
-                stored = {
-                  ...stored,
-                  nodeUrl: base,
-                  mainDepth: after.mainDepth,
-                  tipPrevPkh: after.tipPrevPkh,
-                  inceptionDone: true,
-                };
-                await saveVault(stored);
-              } else {
-                stored = { ...stored, nodeUrl: base };
-                await saveVault(stored);
-              }
-            }
-          }
-        } catch {
-          /* keep the local vault; inception can be retried from the popup */
-        }
+        const incepted = await broadcastInceptionFor(stored, String(message.origin || ""));
+        stored = incepted.vault;
         sendResponse({
           ok: true,
           existing: false,
@@ -1029,6 +1057,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           baseAddress: baseReceiveAddress(mnemonic),
           mnemonic,
           inceptionDone: !!stored.inceptionDone,
+          inceptionError: incepted.error,
         });
       } catch (e) {
         sendResponse({
@@ -1037,6 +1066,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           extVersion: EXT_VERSION,
           canCreateVault: true,
         });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === "YADA_INCEPT_VAULT") {
+    void (async () => {
+      try {
+        const v = await loadVault();
+        if (!v?.mnemonic) {
+          sendResponse({ ok: false, message: "no vault" });
+          return;
+        }
+        if (v.inceptionDone) {
+          sendResponse({ ok: true, inceptionDone: true, username: (v.username || "").replace(/^@/, "") });
+          return;
+        }
+        const done = await broadcastInceptionFor(v, String(message.origin || ""));
+        sendResponse({
+          ok: true,
+          inceptionDone: !!done.vault.inceptionDone,
+          inceptionError: done.error,
+          username: (done.vault.username || "").replace(/^@/, ""),
+          baseAddress: baseReceiveAddress(done.vault.mnemonic),
+        });
+      } catch (e) {
+        sendResponse({ ok: false, message: e instanceof Error ? e.message : String(e) });
       }
     })();
     return true;

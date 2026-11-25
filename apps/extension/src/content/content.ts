@@ -112,6 +112,30 @@ window.addEventListener("message", (event) => {
     );
   }
 
+  if (data.type === "YADA_PASSWORD_INCEPT") {
+    const requestId = data.requestId;
+    chrome.runtime.sendMessage(
+      {
+        type: "YADA_INCEPT_VAULT",
+        requestId,
+        origin: window.location.origin,
+      },
+      (response) => {
+        const err = chrome.runtime.lastError;
+        window.postMessage(
+          {
+            type: "YADA_PASSWORD_INCEPT_RESULT",
+            requestId,
+            ...(err
+              ? { ok: false, message: err.message }
+              : response || { ok: false, message: "no response" }),
+          },
+          "*"
+        );
+      }
+    );
+  }
+
   if (data.type === "YADA_PASSWORD_SIGNIN") {
     const requestId = data.requestId;
     chrome.runtime.sendMessage(
