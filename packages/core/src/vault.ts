@@ -247,13 +247,18 @@ function kelField(entry: any, name: string): string {
   return typeof nested === "string" ? nested : "";
 }
 
-/** Highest on-log event. The next signer is its prerotated address. */
+function kelEntryIsMempool(entry: any): boolean {
+  return Boolean(entry?.mempool ?? entry?.txn?.mempool);
+}
+
+/** Highest on-chain event. The next signer is its prerotated address. */
 export function latestPublishedKelTip(
   entries: unknown[] | undefined | null
 ): PublishedKelTip | null {
   if (!Array.isArray(entries)) return null;
   let best: PublishedKelTip | null = null;
   for (const entry of entries) {
+    if (kelEntryIsMempool(entry)) continue;
     const prerotatedKeyHash = kelField(entry, "prerotated_key_hash");
     const publicKeyHash = kelField(entry, "public_key_hash");
     if (!prerotatedKeyHash || !publicKeyHash) continue;
@@ -295,12 +300,13 @@ export function identityAtPublishedTip(
 
 /** Derivation steps from a KEL list: one inception, plus real rotations. */
 export function kelRotationDepth(
-  entries: Array<{ prev_public_key_hash?: string }> | undefined | null
+  entries: Array<{ prev_public_key_hash?: string; mempool?: boolean; txn?: { mempool?: boolean } }> | undefined | null
 ): number {
   if (!Array.isArray(entries) || !entries.length) return 0;
   let inception = 0;
   let rotations = 0;
   for (const e of entries) {
+    if (kelEntryIsMempool(e)) continue;
     const prev = (e && e.prev_public_key_hash) || "";
     if (!prev) {
       if (!inception) inception = 1;
@@ -328,10 +334,12 @@ export type InceptionStatus = {
 export async function fetchInceptionStatus(
   api: NodeApi,
   publicKeyHex: string,
-  username?: string
+  username?: string,
+  opts?: { onchainOnly?: boolean }
 ): Promise<InceptionStatus> {
   const q = new URLSearchParams({ public_key: publicKeyHex });
   if (username?.trim()) q.set("username", username.trim());
+  if (opts?.onchainOnly) q.set("onchain_only", "1");
   let statusProbe: InceptionStatus | null = null;
   try {
     const res = await httpJson(api, `/identity-inception-status?${q.toString()}`);
@@ -354,7 +362,7 @@ export async function fetchInceptionStatus(
   }
 
   try {
-    const depth = await fetchKelDepth(api, publicKeyHex);
+    const depth = await fetchKelDepth(api, publicKeyHex, opts?.onchainOnly);
     if (depth >= 1) {
       return {
         incepted: true,
@@ -384,7 +392,8 @@ export async function fetchInceptionStatus(
 
 export async function fetchKelDepth(
   api: NodeApi,
-  publicKeyHex: string
+  publicKeyHex: string,
+  onchainOnly = false
 ): Promise<number> {
   try {
     const has = await httpJson(
@@ -397,9 +406,11 @@ export async function fetchKelDepth(
   } catch {
     /* optional probe */
   }
+  const q = new URLSearchParams({ public_key: publicKeyHex });
+  if (onchainOnly) q.set("onchain_only", "1");
   const kel = await httpJson(
     api,
-    `/key-event-log?public_key=${encodeURIComponent(publicKeyHex)}`
+    `/key-event-log?${q.toString()}`
   );
   if (kel.ok && Array.isArray(kel.body?.key_event_log)) {
     return kelRotationDepth(kel.body.key_event_log);
@@ -440,7 +451,8 @@ export function identityFromInceptionStatus(
 /** Probe node and return identity + inceptionDone for local vault sync. */
 export async function syncInceptionFromNode(
   api: NodeApi,
-  identity: VaultIdentity
+  identity: VaultIdentity,
+  opts?: { onchainOnly?: boolean }
 ): Promise<{
   identity: VaultIdentity;
   inceptionDone: boolean;
@@ -451,11 +463,14 @@ export async function syncInceptionFromNode(
   const status = await fetchInceptionStatus(
     api,
     identity.k0.publicKeyHex,
-    identity.username
+    identity.username,
+    opts
   );
+  const kelQuery = new URLSearchParams({ public_key: identity.k0.publicKeyHex });
+  if (opts?.onchainOnly) kelQuery.set("onchain_only", "1");
   const kel = await httpJson(
     api,
-    `/key-event-log?public_key=${encodeURIComponent(identity.k0.publicKeyHex)}`
+    `/key-event-log?${kelQuery.toString()}`
   );
   const tip =
     kel.ok && Array.isArray(kel.body?.key_event_log)

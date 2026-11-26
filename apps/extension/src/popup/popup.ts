@@ -783,6 +783,7 @@ async function refreshStatus() {
   const v = await loadVault();
   if (!v) {
     $("k0Addr").textContent = "no vault";
+    $("payoutAddr").textContent = "—";
     $("baseAddr").textContent = "—";
     $("mainDepth").textContent = "—";
     $("siteList").textContent = "—";
@@ -791,6 +792,7 @@ async function refreshStatus() {
   try {
     const id = identityFromStored(v);
     $("k0Addr").textContent = id.k0.address;
+    $("payoutAddr").textContent = id.tipSigner.address;
     $("baseAddr").textContent = baseReceiveAddress(v.mnemonic);
     $("mainDepth").textContent =
       String(v.mainDepth) + (v.inceptionDone ? " (incepted)" : " (pending inception)");

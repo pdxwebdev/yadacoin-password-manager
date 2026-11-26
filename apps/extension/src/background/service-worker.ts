@@ -158,6 +158,60 @@ async function refreshInception(
 }
 
 /**
+ * Canonical payout key for onramp swaps and unwraps.
+ *
+ * Only confirmed key events may choose the Yadacoin address. Using a
+ * mempool-only rotation (or a cached depth ahead of the chain) could pay an
+ * address the current identity cannot use yet.
+ */
+async function canonicalPayoutIdentity(
+  v: StoredVault,
+  baseUrl: string
+): Promise<VaultIdentity> {
+  const base = normalizeNodeBaseUrl(baseUrl);
+  if (!base) throw new Error("could not resolve the password home node for the Yadacoin address");
+  const seeded = unlockIdentity(v.mnemonic, v.secondFactor, v.username, {
+    identityType: v.identityType,
+    mainDepth: v.mainDepth,
+    tipPrevPkh: v.tipPrevPkh,
+  });
+  const synced = await syncInceptionFromNode(
+    { baseUrl: base },
+    seeded,
+    { onchainOnly: true }
+  );
+  if (!synced.aligned) {
+    throw new Error(
+      synced.alignError ||
+        "Refusing to pay: the key event tip is not confirmed on-chain"
+    );
+  }
+  if (
+    synced.identity.tipSigner.address === synced.identity.k0.address &&
+    synced.identity.mainDepth > 1
+  ) {
+    throw new Error("Refusing to pay: tip signer is still the inception key");
+  }
+  await saveVault({
+    ...v,
+    nodeUrl: base,
+    inceptionDone: true,
+    mainDepth: synced.identity.mainDepth,
+    tipPrevPkh: synced.identity.tipPrevPkh,
+  });
+  return synced.identity;
+}
+
+/**
+ * The stable Yadacoin identity address is K0. The KEL tip can spend funds
+ * sent to any address in the same KEL, so paying K0 avoids showing users a
+ * rotating signing-key address that looks unrelated to their identity.
+ */
+function yadacoinPayoutAddress(identity: VaultIdentity): string {
+  return identity.k0.address;
+}
+
+/**
  * Broadcast inception for a stored vault if it is not on the home SP yet.
  * Resolves home, refreshes from the node, and broadcasts the inception txn.
  * The signed txn is also sent to the return-node origin (where the user will
@@ -985,6 +1039,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ ok: false, message: "no vault" });
           return;
         }
+        const baseUrl = (await apiBase()).replace(/\/+$/, "");
+        const identity = await canonicalPayoutIdentity(v, baseUrl);
         const permit = await signUsdcPermit(v.mnemonic, (message as { source_amount?: string }).source_amount);
         await chrome.storage.local.remove("yadaPendingSwap");
         const done = await chrome.storage.local.get("yadaFulfilledSwaps");
@@ -992,16 +1048,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const sessionId = (message as { sessionId?: string }).sessionId;
         if (sessionId && !ids.includes(sessionId)) ids.push(sessionId);
         await chrome.storage.local.set({ yadaFulfilledSwaps: ids.slice(-100) });
-        const identity = unlockIdentity(v.mnemonic, v.secondFactor, v.username, {
-          identityType: v.identityType,
-          mainDepth: v.mainDepth,
-          tipPrevPkh: v.tipPrevPkh,
-        });
         const saved = {
           ...permit,
           session_id: sessionId || "",
           wallet_address: permit.owner,
-          yadacoin_address: identity.tipSigner.address,
+          yadacoin_address: yadacoinPayoutAddress(identity),
           source_amount: (message as { source_amount?: string }).source_amount || "",
         };
         const storedOrigin = await chrome.storage.local.get("yadaOnrampOrigin");
@@ -1009,7 +1060,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           "http://127.0.0.1:8111",
           "http://localhost:8111",
           String(storedOrigin.yadaOnrampOrigin || "").replace(/\/+$/, ""),
-          (await apiBase()).replace(/\/+$/, ""),
+          baseUrl,
         ]);
         await Promise.all([...bases].filter((base) => base.startsWith("http")).map((base) =>
           fetch(base + "/crypto-onramp/pending-swap", {
@@ -1019,7 +1070,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }).catch(() => undefined)
         ));
         notifyOnramp("YADA_SWAP_DONE", saved);
-        sendResponse({ ok: true, ...permit, yadacoin_address: identity.tipSigner.address });
+        sendResponse({ ok: true, ...permit, yadacoin_address: yadacoinPayoutAddress(identity) });
       } catch (e) {
         sendResponse({ ok: false, message: e instanceof Error ? e.message : String(e) });
       }
@@ -1051,15 +1102,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ ok: false });
           return;
         }
-        const seeded = unlockIdentity(v.mnemonic, v.secondFactor, v.username, {
-          identityType: v.identityType,
-          mainDepth: v.mainDepth,
-          tipPrevPkh: v.tipPrevPkh,
-        });
+        const baseUrl = await apiBase();
+        const identity = await canonicalPayoutIdentity(v, baseUrl);
         await chrome.storage.local.set({
           yadaPendingUnwrap: {
             amount: "WYDA balance",
-            yadacoin_address: seeded.tipSigner.address,
+            yadacoin_address: yadacoinPayoutAddress(identity),
             wallet_address: baseReceiveAddress(v.mnemonic),
           },
         });
@@ -1077,14 +1125,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         let v = await loadVault();
         if (!v?.mnemonic) throw new Error("no vault");
         const baseUrl = await apiBase();
-        const seeded = unlockIdentity(v.mnemonic, v.secondFactor, v.username, {
-          identityType: v.identityType,
-          mainDepth: v.mainDepth,
-          tipPrevPkh: v.tipPrevPkh,
-        });
-        const synced = await syncInceptionFromNode({ baseUrl }, seeded);
-        if (!synced.aligned) throw new Error(synced.alignError || "key event tip is not this vault");
-        const yadacoinAddress = synced.identity.tipSigner.address;
+        const identity = await canonicalPayoutIdentity(v, baseUrl);
+        const yadacoinAddress = yadacoinPayoutAddress(identity);
         const burned = await unwrapWyda(v.mnemonic, yadacoinAddress);
         await chrome.storage.local.set({
           yadaLastUnwrap: {
