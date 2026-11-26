@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Yada Password",
-  "version": "0.1.43",
+  "version": "0.1.44",
   "description": "YadaCoin KEL password rotation manager with customizable theming",
   "permissions": [
     "activeTab",
@@ -28,7 +28,9 @@
         "https://yadacoin.com/*",
         "https://*.yadacoin.com/*"
       ],
-      "js": ["content.js"],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ],

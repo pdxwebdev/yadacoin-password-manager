@@ -766,6 +766,26 @@ async function activePageOrigin(): Promise<string> {
   }
 }
 
+let lastOpenedAuthSession = "";
+function isInteractiveSignIn(action: string | undefined): boolean {
+  return ["operator", "signin", "register"].includes(
+    String(action || "").toLowerCase()
+  );
+}
+/** Surface a delivered sign-in request once instead of waiting for a badge click. */
+async function openAuthPopup(sessionId: string): Promise<void> {
+  if (!sessionId || sessionId === lastOpenedAuthSession) return;
+  lastOpenedAuthSession = sessionId;
+  // Give the requesting page time to persist yadaActiveAuthSession/rp_token
+  // from the POST response before the popup looks for it.
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  try {
+    await chrome.action.openPopup?.();
+  } catch {
+    /* popup may be unavailable in this browser; the badge still marks it */
+  }
+}
+
 async function connectAuthSocket(baseUrl: string): Promise<void> {
   const v = await loadVault();
   if (!v?.inceptionDone || !v.username) return;
@@ -829,14 +849,27 @@ async function connectAuthSocket(baseUrl: string): Promise<void> {
     if (msg.method === "join_password_auth_confirm") {
       const row = (payload as { pending?: PasswordAuthRequestPayload[] } | undefined)?.pending?.[0];
       if (row) {
-        void chrome.storage.local.set({ yadaPendingAuth: row, yadaPendingHome: base });
-        void chrome.action.setBadgeText({ text: "1" });
+        void chrome.storage.local
+          .set({ yadaPendingAuth: row, yadaPendingHome: base })
+          .then(() => {
+            void chrome.action.setBadgeText({ text: "1" });
+            if (isInteractiveSignIn(row.action)) {
+              void openAuthPopup(String(row.session_id || ""));
+            }
+          });
       }
       return;
     }
     if (msg.method === "password_auth_request" && payload && "session_id" in payload) {
-      void chrome.storage.local.set({ yadaPendingAuth: payload, yadaPendingHome: base });
-      void chrome.action.setBadgeText({ text: "1" });
+      const request = payload as PasswordAuthRequestPayload;
+      void chrome.storage.local
+        .set({ yadaPendingAuth: request, yadaPendingHome: base })
+        .then(() => {
+          void chrome.action.setBadgeText({ text: "1" });
+          if (isInteractiveSignIn(request.action)) {
+            void openAuthPopup(String(request.session_id || ""));
+          }
+        });
     }
     if (msg.method === "wyda_swap_request" && payload && "session_id" in payload) {
       if ((payload as { permit_signed?: boolean }).permit_signed) return;

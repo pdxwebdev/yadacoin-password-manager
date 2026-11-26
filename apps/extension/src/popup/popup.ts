@@ -86,25 +86,15 @@ const ACTIVE_AUTH_STORAGE_KEY = "yadaActiveAuthSession";
 let activeAuthRpToken = "";
 const ACTIVE_AUTH_MAX_AGE_MS = 6 * 60 * 1000;
 
-/** Session the active tab explicitly started; only that one may be approved. */
-async function getActiveAuthSession(): Promise<ActiveAuthSession | null> {
+/** Read the auth session a tab started from its sessionStorage. */
+async function readAuthSessionFromTab(
+  tabId: number,
+  tabUrl: string
+): Promise<ActiveAuthSession | null> {
   try {
-    if (
-      typeof chrome === "undefined" ||
-      !chrome.tabs?.query ||
-      !chrome.scripting?.executeScript
-    ) {
-      return null;
-    }
-    const tabs = await chrome.tabs.query({
-      active: true,
-      lastFocusedWindow: true,
-    });
-    const tab = tabs.find((t) => t.id != null && t.url && /^https?:/i.test(t.url));
-    if (!tab?.id || !tab.url) return null;
-    const tabOrigin = new URL(tab.url).origin.toLowerCase();
+    const tabOrigin = new URL(tabUrl).origin.toLowerCase();
     const results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
+      target: { tabId },
       func: (key: string) => {
         try {
           return sessionStorage.getItem(key) || "";
@@ -124,6 +114,58 @@ async function getActiveAuthSession(): Promise<ActiveAuthSession | null> {
   } catch {
     return null;
   }
+}
+
+/** Session the requesting tab started. Falls back to other tabs in the window. */
+async function getActiveAuthSession(): Promise<ActiveAuthSession | null> {
+  try {
+    if (
+      typeof chrome === "undefined" ||
+      !chrome.tabs?.query ||
+      !chrome.scripting?.executeScript
+    ) {
+      return null;
+    }
+    const tabs = await chrome.tabs.query({
+      active: true,
+      lastFocusedWindow: true,
+    });
+    const activeTab = tabs.find(
+      (t) => t.id != null && t.url && /^https?:\/\//i.test(t.url)
+    );
+    if (activeTab?.id && activeTab.url) {
+      const active = await readAuthSessionFromTab(activeTab.id, activeTab.url);
+      if (active) return active;
+    }
+    // The extension popup can be opened from a different tab. Look for the
+    // sign-in tab that actually started the request in this window.
+    const windowTabs = await chrome.tabs.query({ lastFocusedWindow: true });
+    for (const tab of windowTabs) {
+      if (!tab.id || !tab.url || !/^https?:\/\//i.test(tab.url)) continue;
+      if (activeTab?.id != null && tab.id === activeTab.id) continue;
+      const found = await readAuthSessionFromTab(tab.id, tab.url);
+      if (found) return found;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The WebSocket push can beat the page's POST response, so the requesting tab
+ * may not have written yadaActiveAuthSession yet when the popup opens. Retry
+ * briefly before falling back to the 6-digit code.
+ */
+async function getActiveAuthSessionWithRetry(): Promise<ActiveAuthSession | null> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const found = await getActiveAuthSession();
+    if (found) return found;
+    if (attempt < 4) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+  return null;
 }
 
 async function fillSiteFromOrigin(origin: string, vault: StoredVault | null) {
@@ -453,24 +495,30 @@ async function drainPendingRequests(): Promise<void> {
     return;
   }
   const pageOrigin = await getActiveOrigin();
-  const active = await getActiveAuthSession();
+  const active = await getActiveAuthSessionWithRetry();
   const stored = await chrome.storage.local.get(["yadaPendingAuth", "yadaPendingHome"]);
-  const storedSite = String(stored.yadaPendingAuth?.site || "");
-  const storedMatchesPage =
-    (!pageOrigin ||
-      !storedSite.startsWith("http") ||
-      sameNode(storedSite, pageOrigin)) &&
-    !!active &&
-    active.session_id === stored.yadaPendingAuth?.session_id;
-  if (stored.yadaPendingAuth?.session_id && storedMatchesPage) {
-    activeAuthRpToken = active?.rp_token || "";
-    renderPendingRequest(stored.yadaPendingAuth, stored.yadaPendingHome || "");
-    showAlert(`Pending ${stored.yadaPendingAuth.action} for ${stored.yadaPendingAuth.site}`, "success");
+  const storedPending = stored.yadaPendingAuth as PasswordAuthRequestPayload | undefined;
+  const storedFresh =
+    !!storedPending?.session_id &&
+    (!storedPending.expires_at ||
+      Number(storedPending.expires_at) * 1000 > Date.now());
+  if (storedPending?.session_id && !storedFresh) {
+    await chrome.storage.local.remove(["yadaPendingAuth", "yadaPendingHome"]);
+  }
+  const storedSite = String(storedPending?.site || "");
+  const storedSiteMatchesPage =
+    !pageOrigin || !storedSite.startsWith("http") || sameNode(storedSite, pageOrigin);
+  const storedMatchesActive =
+    !!active && active.session_id === storedPending?.session_id;
+  if (storedFresh && (storedSiteMatchesPage || storedMatchesActive || !active)) {
+    // Same-browser approvals use the tab's rp_token. If the requesting tab is
+    // not readable (wrong window, disabled storage), still show the request
+    // and fall back to the 6-digit code shown in the requesting browser.
+    activeAuthRpToken = storedMatchesActive ? active?.rp_token || "" : "";
+    renderPendingRequest(storedPending!, stored.yadaPendingHome || "");
+    showAlert(`Pending ${storedPending!.action} for ${storedPending!.site}`, "success");
     setTab("request");
     return;
-  }
-  if (stored.yadaPendingAuth?.session_id && !storedMatchesPage) {
-    await chrome.storage.local.remove(["yadaPendingAuth", "yadaPendingHome"]);
   }
   const bases: string[] = [];
   try {
@@ -499,14 +547,22 @@ async function drainPendingRequests(): Promise<void> {
         }
       );
       checked++;
-      // Only the request the active tab started is approvable. This prevents
-      // a request planted by another browser from being approved here.
-      const match = active
+      // Prefer the request the active tab started. If that tab cannot be
+      // read, still surface a pending request for this identity; approval
+      // then requires the 6-digit code shown in the requesting browser.
+      const sameBrowser = active
         ? (rows || []).find((r) => r.session_id === active.session_id)
-        : null;
+        : undefined;
+      const pageMatch = (rows || []).find(
+        (r) => pageOrigin && r.site && sameNode(r.site, pageOrigin)
+      );
+      const match =
+        sameBrowser ||
+        pageMatch ||
+        (!active ? (rows || [])[0] : undefined);
       if (match) {
         first = match;
-        activeAuthRpToken = active?.rp_token || "";
+        activeAuthRpToken = sameBrowser ? active?.rp_token || "" : "";
         from = base.replace(/\/+$/, "");
         break;
       }
@@ -591,24 +647,26 @@ async function approvePendingRequest(): Promise<void> {
   }
   if (!pendingRemote) return;
   const active = await getActiveAuthSession();
-  if (!active || active.session_id !== pendingRemote.session_id) {
-    pendingRemote = null;
-    renderPendingRequest(null);
-    showAlert(
-      "This request was not started in the active tab. Open the page that started sign-in and approve there.",
-      "error"
-    );
-    return;
-  }
+  const sameBrowser =
+    !!active && active.session_id === pendingRemote.session_id;
+  const rpToken = sameBrowser ? active?.rp_token || activeAuthRpToken || "" : "";
+  if (!rpToken) activeAuthRpToken = "";
   const verificationCode = authCodeValue();
-  if (authNeedsCode(pendingRemote) && verificationCode.length !== 6) {
+  const needsCode =
+    CODE_ACTIONS.has(String(pendingRemote.action || "").toLowerCase()) &&
+    !rpToken;
+  if (needsCode && verificationCode.length !== 6) {
+    const codeField = $("authCodeField") as HTMLElement | null;
+    if (codeField) codeField.hidden = false;
+    const codeInput = $("authCode") as HTMLInputElement | null;
+    if (codeInput) codeInput.focus();
+    updateApproveEnabled(pendingRemote);
     showAlert("Enter the 6-digit code shown in the requesting browser.", "error");
     return;
   }
   const p = pendingRemote;
   const nodeUrl = pendingNodeUrl;
   const pageOrigin = await getActiveOrigin();
-  const sameBrowser = !!activeAuthRpToken;
   setApproveBusy(true);
   showAlert("Approving…", "success");
   const res = (await chrome.runtime.sendMessage({
@@ -617,7 +675,7 @@ async function approvePendingRequest(): Promise<void> {
     pendingNodeUrl: nodeUrl,
     pageOrigin,
     verificationCode,
-    rpToken: sameBrowser ? activeAuthRpToken : "",
+    rpToken,
   })) as { ok?: boolean; message?: string } | undefined;
   if (chrome.runtime.lastError) {
     throw new Error(chrome.runtime.lastError.message || "approve failed");
