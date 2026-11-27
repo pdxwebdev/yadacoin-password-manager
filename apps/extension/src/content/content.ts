@@ -71,6 +71,7 @@ window.addEventListener("message", (event) => {
       {
         type: "YADA_USE_AUTH_HOME",
         home: String(data.home || ""),
+        username: String(data.username || ""),
       },
       () => {
         void chrome.runtime.lastError;

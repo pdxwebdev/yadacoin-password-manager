@@ -847,7 +847,19 @@ async function connectAuthSocket(baseUrl: string): Promise<void> {
       | { pending?: PasswordAuthRequestPayload[] }
       | undefined;
     if (msg.method === "join_password_auth_confirm") {
-      const row = (payload as { pending?: PasswordAuthRequestPayload[] } | undefined)?.pending?.[0];
+      const list =
+        (
+          payload as
+            | { pending?: PasswordAuthRequestPayload[] }
+            | undefined
+        )?.pending || [];
+      const row = list
+        .slice()
+        .sort(
+          (a, b) =>
+            Number((b as { expires_at?: number }).expires_at || 0) -
+            Number((a as { expires_at?: number }).expires_at || 0)
+        )[0];
       if (row) {
         void chrome.storage.local
           .set({ yadaPendingAuth: row, yadaPendingHome: base })
@@ -981,7 +993,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
       try {
-        const v = await loadVault();
+        const wanted = String(message.username || "")
+          .replace(/^@/, "")
+          .trim();
+        let v = await loadVault();
+        if (
+          wanted &&
+          (!v?.username || v.username.replace(/^@/, "") !== wanted)
+        ) {
+          const entries = await store.listVaults();
+          const match = entries.find(
+            (entry: { data?: { username?: string } }) =>
+              (entry.data?.username || "").replace(/^@/, "") === wanted
+          );
+          if (!match) {
+            sendResponse({
+              ok: false,
+              message: `no vault for ${wanted}; add or select it in Yada Password`,
+            });
+            return;
+          }
+          await store.setActiveVaultId(match.id);
+          v = await loadVault();
+        }
         if (v?.username) {
           const username = v.username.replace(/^@/, "");
           forcedAuthHome = { username, base: home };
@@ -989,8 +1023,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           rememberHome(username, home);
           await chrome.storage.local.set({ yadaAuthHome: { username, home } });
         }
+        // Force a fresh join so pending requests are drained and a half-open
+        // socket cannot hide the request.
+        if (authWs) {
+          try {
+            authWs.onclose = null;
+            authWs.close();
+          } catch {
+            /* ignore */
+          }
+          authWs = null;
+          authWsKey = "";
+        }
         await connectAuthSocket(home);
-        sendResponse({ ok: true, home });
+        sendResponse({ ok: true, home, username: v?.username || "" });
       } catch (e) {
         sendResponse({ ok: false, message: e instanceof Error ? e.message : String(e) });
       }
